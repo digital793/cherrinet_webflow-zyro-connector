@@ -30,6 +30,10 @@ export default async function handler(req, res) {
   // Webflow sends the submitted fields inside req.body.data
   const data = req.body.data || req.body;
 
+  // TEMPORARY DEBUG LOG — remove once field names are confirmed.
+  // This prints the exact payload Webflow sent, so we can see the real field names.
+  console.log('RAW WEBFLOW PAYLOAD:', JSON.stringify(req.body));
+
   try {
     // ---- Step 1: find the subscriber ----
     let lookupUrl;
