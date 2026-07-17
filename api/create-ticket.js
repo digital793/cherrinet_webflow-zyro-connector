@@ -1,13 +1,11 @@
 // api/create-ticket.js
 //
-// This function receives the "Let's Get You Online" Webflow form submission,
-// finds the matching Zyro subscriber, and files a support ticket.
+// Receives the "Let's Get You Online" Webflow form submission, finds the
+// matching Zyro subscriber, and files a support ticket.
 //
-// IMPORTANT: fill in the field names below to match your ACTUAL Webflow field
-// names (Webflow Designer → click a field → right panel → "Name"). The names
-// used here (data.full_name, data.registered_mobile, etc.) are guesses based
-// on the labels in your screenshots — they will almost certainly need small
-// adjustments once you check the real field names.
+// Field names below are confirmed from the actual Webflow payload logged on
+// 2026-07-17 (see the RAW WEBFLOW PAYLOAD debug line). If you rename fields
+// in the Webflow Designer later, update the keys here to match.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -30,17 +28,16 @@ export default async function handler(req, res) {
   // Webflow sends the submitted fields inside req.body.data
   const data = req.body.data || req.body;
 
-  // TEMPORARY DEBUG LOG — remove once field names are confirmed.
-  // This prints the exact payload Webflow sent, so we can see the real field names.
-  console.log('RAW WEBFLOW PAYLOAD:', JSON.stringify(req.body));
-
   try {
     // ---- Step 1: find the subscriber ----
+    const accountId = data['Account/ Customer ID'];
+    const phone     = data['Phone Number'];
+
     let lookupUrl;
-    if (data.account_customer_id) {
-      lookupUrl = `${ZYRO_BASE}/api/v1/subscribers?account_number=${encodeURIComponent(data.account_customer_id)}`;
-    } else if (data.registered_mobile) {
-      lookupUrl = `${ZYRO_BASE}/api/v1/subscribers?phone=${encodeURIComponent(data.registered_mobile)}`;
+    if (accountId) {
+      lookupUrl = `${ZYRO_BASE}/api/v1/subscribers?account_number=${encodeURIComponent(accountId)}`;
+    } else if (phone) {
+      lookupUrl = `${ZYRO_BASE}/api/v1/subscribers?phone=${encodeURIComponent(phone)}`;
     } else {
       return res.status(400).json({ error: 'missing_identifier' });
     }
@@ -57,15 +54,19 @@ export default async function handler(req, res) {
     const subscriber_id = lookup.data[0].id;
 
     // ---- Step 2: build a description from all the extra form fields ----
+    const specifyIssue   = data['Specify issue'];
     const description = [
-      data.specify_issue ? `Issue: ${data.specify_issue}` : null,
-      data.previous_ticket_id ? `Follow-up to: ${data.previous_ticket_id}` : null,
-      data.describe_the_issue ? `Details: ${data.describe_the_issue}` : null,
-      data.troubleshooting_steps ? `Troubleshooting tried: ${data.troubleshooting_steps}` : null,
-      data.router_light_status ? `Router light status: ${data.router_light_status}` : null,
-      data.preferred_contact_method ? `Preferred contact: ${data.preferred_contact_method}` : null,
-      data.best_time_to_call ? `Best time to call: ${data.best_time_to_call}` : null,
-      data.alternate_number ? `Alt number: ${data.alternate_number}` : null
+      data.issue_type ? `Issue type: ${data.issue_type}` : null,
+      specifyIssue ? `Issue: ${specifyIssue}` : null,
+      data['Previous Ticket ID'] ? `Follow-up to: ${data['Previous Ticket ID']}` : null,
+      data['Describe the issue'] ? `Details: ${data['Describe the issue']}` : null,
+      data.Troubleshooting ? `Troubleshooting tried: ${data.Troubleshooting}` : null,
+      data.router_status ? `Router light status: ${data.router_status}` : null,
+      data.contact_method ? `Preferred contact: ${data.contact_method}` : null,
+      data['Best time to call *'] ? `Best time to call: ${data['Best time to call *']}` : null,
+      data['Alternative Phone Number'] ? `Alt number: ${data['Alternative Phone Number']}` : null,
+      data.Email ? `Email: ${data.Email}` : null,
+      data.Evidence ? `Evidence attachment: ${data.Evidence}` : null
     ].filter(Boolean).join('\n');
 
     // ---- Step 3: create the ticket ----
@@ -74,9 +75,11 @@ export default async function handler(req, res) {
       headers,
       body: JSON.stringify({
         subscriber_id,
-        subject: data.specify_issue || 'Support request via website',
+        subject: specifyIssue || data.issue_type || 'Support request via website',
         description,
-        priority: data.specify_issue === 'Completely no internet' ? 'high' : 'medium',
+        priority: (data.issue_type === 'no_internet' || specifyIssue === 'completely_no_internet')
+          ? 'high'
+          : 'medium',
         source: 'portal'
         // sub_category_id intentionally left out for now — add once you've
         // pulled real IDs from GET /api/v2/ticket-taxonomy
