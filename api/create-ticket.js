@@ -1,18 +1,20 @@
 // api/create-ticket.js
 //
-// Receives the "Let's Get You Online" Webflow form submission, finds the
-// matching Zyro subscriber, and files a support ticket.
+// Receives the "Let's Get You Online" / Complaint Form Webflow submission,
+// finds the matching Zyro subscriber, and files a support ticket.
 //
 // Field names below are confirmed from the actual Webflow payload logged on
-// 2026-07-17 (see the RAW WEBFLOW PAYLOAD debug line). If you rename fields
-// in the Webflow Designer later, update the keys here to match.
+// 2026-07-17 (see the RAW WEBFLOW PAYLOAD debug line), EXCEPT
+// `issue_category` (the top-level "What's the issue about?" button group) —
+// double check that key against your real Webflow field name and update the
+// map below (and the `data.issue_category` references) if it differs.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
-  const ZYRO_BASE = process.env.ZYRO_BASE_URL;   // e.g. https://your-tenant.zyro.io
+  const ZYRO_BASE = process.env.ZYRO_BASE_URL;   // e.g. https://tickets.knet.co.in
   const API_KEY   = process.env.ZYRO_API_KEY;    // your ticket-only zyro_ak_... key
 
   if (!ZYRO_BASE || !API_KEY) {
@@ -28,10 +30,23 @@ export default async function handler(req, res) {
   // Webflow sends the submitted fields inside req.body.data
   const data = req.body.data || req.body;
 
+  // ---- Top-level "What's the issue about?" -> Zyro intake_sub_category_id ----
+  // Keep this deliberately simple: just enough to satisfy Zyro's required
+  // field. Everything else (specify issue, troubleshooting, router status,
+  // contact prefs, etc.) goes into the description as plain label: value text.
+  const SUB_CATEGORY_MAP = {
+    'No internet/disconnection': 1,   // connectivity
+    'Slow speeds/drops':         2,   // speed
+    'Billing/Payment issue':     3,   // billing
+    'Installation/Shifting':     4,   // installation
+    'Router/Hardware':           1,   // connectivity (closest fit)
+    'Other/General query':       8    // general
+  };
+
   try {
     // ---- Step 1: find the subscriber ----
     const accountId = data['Account/ Customer ID'];
-    const phone     = data['Phone Number'];
+    const phone     = data['Phone Number'] || data['Registered Mobile'];
 
     let lookupUrl;
     if (accountId) {
@@ -53,21 +68,25 @@ export default async function handler(req, res) {
 
     const subscriber_id = lookup.data[0].id;
 
-    // ---- Step 2: build a description from all the extra form fields ----
-    const specifyIssue   = data['Specify issue'];
+    // ---- Step 2: build a description from every form field, label: value ----
+    const issueCategory = data.issue_category; // <-- verify this key name in Webflow
+    const specifyIssue  = data['Specify issue'];
+
     const description = [
-      data.issue_type ? `Issue type: ${data.issue_type}` : null,
-      specifyIssue ? `Issue: ${specifyIssue}` : null,
-      data['Previous Ticket ID'] ? `Follow-up to: ${data['Previous Ticket ID']}` : null,
-      data['Describe the issue'] ? `Details: ${data['Describe the issue']}` : null,
-      data.Troubleshooting ? `Troubleshooting tried: ${data.Troubleshooting}` : null,
-      data.router_status ? `Router light status: ${data.router_status}` : null,
-      data.contact_method ? `Preferred contact: ${data.contact_method}` : null,
-      data['Best time to call *'] ? `Best time to call: ${data['Best time to call *']}` : null,
-      data['Alternative Phone Number'] ? `Alt number: ${data['Alternative Phone Number']}` : null,
-      data.Email ? `Email: ${data.Email}` : null,
-      data.Evidence ? `Evidence attachment: ${data.Evidence}` : null
+      issueCategory ? `Issue category: ${issueCategory}` : null,
+      specifyIssue ? `Specify issue: ${specifyIssue}` : null,
+      data['Previous Ticket ID'] ? `Previous ticket ID: ${data['Previous Ticket ID']}` : null,
+      data['Describe the issue'] ? `Describe the issue: ${data['Describe the issue']}` : null,
+      data['Troubleshooting steps'] ? `Troubleshooting steps: ${data['Troubleshooting steps']}` : null,
+      data['Router Light Status'] ? `Router light status: ${data['Router Light Status']}` : null,
+      data['Preferred contact method'] ? `Preferred contact method: ${data['Preferred contact method']}` : null,
+      data['Best time to call'] ? `Best time to call: ${data['Best time to call']}` : null,
+      data['Alternate number'] ? `Alternate number: ${data['Alternate number']}` : null,
+      data['Full Name'] ? `Full name: ${data['Full Name']}` : null,
+      data['Email Address'] ? `Email address: ${data['Email Address']}` : null
     ].filter(Boolean).join('\n');
+
+    const sub_category_id = SUB_CATEGORY_MAP[issueCategory] || 8; // fallback: general
 
     // ---- Step 3: create the ticket ----
     const ticketRes = await fetch(`${ZYRO_BASE}/api/v2/tickets`, {
@@ -75,14 +94,13 @@ export default async function handler(req, res) {
       headers,
       body: JSON.stringify({
         subscriber_id,
-        subject: specifyIssue || data.issue_type || 'Support request via website',
+        subject: specifyIssue || issueCategory || 'Support request via website',
         description,
-        priority: (data.issue_type === 'no_internet' || specifyIssue === 'completely_no_internet')
+        sub_category_id,
+        priority: (issueCategory === 'No internet/disconnection' || specifyIssue === 'Completely no internet')
           ? 'high'
           : 'medium',
         source: 'portal'
-        // sub_category_id intentionally left out for now — add once you've
-        // pulled real IDs from GET /api/v2/ticket-taxonomy
       })
     });
 
@@ -98,6 +116,13 @@ export default async function handler(req, res) {
     if (ticketRes.status === 409) {
       return res.status(409).json({
         error_message: `You already have an open ticket (${ticket.existing.ticket_number}). Our team is already on it.`
+      });
+    }
+
+    if (ticketRes.status === 422) {
+      console.error('Zyro validation failed:', ticket);
+      return res.status(422).json({
+        error_message: 'There was a problem with the ticket details. Our team has been notified.'
       });
     }
 
