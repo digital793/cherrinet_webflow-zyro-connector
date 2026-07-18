@@ -29,35 +29,24 @@ export default async function handler(req, res) {
   const data = req.body.data || req.body;
 
   try {
-    // ---- Step 1: find the subscriber ----
-    const accountId = data['Account/ Customer ID'];
-    const phone     = data['Phone Number'];
+    // ---- Step 1: find the subscriber (by phone number only) ----
+    const phone = data['Phone Number'];
 
-    if (!accountId && !phone) {
+    if (!phone) {
       return res.status(400).json({ error: 'missing_identifier' });
     }
 
-    async function lookupBy(param, value) {
-      const url = `${ZYRO_BASE}/api/v1/subscribers?${param}=${encodeURIComponent(value)}`;
-      console.log('LOOKUP URL:', url);
-      const r = await fetch(url, { headers });
-      const j = await r.json();
-      console.log('LOOKUP STATUS:', r.status, 'RESPONSE:', JSON.stringify(j));
-      return j;
-    }
+    const lookupUrl = `${ZYRO_BASE}/api/v1/subscribers?phone=${encodeURIComponent(phone)}`;
+    console.log('LOOKUP URL:', lookupUrl);
 
-    // Try account ID first (more precise), fall back to phone if no match.
-    let lookup = { total: 0 };
-    if (accountId) {
-      lookup = await lookupBy('account_number', accountId);
-    }
-    if (!lookup.total && phone) {
-      lookup = await lookupBy('phone', phone);
-    }
+    const lookupRes = await fetch(lookupUrl, { headers });
+    const lookup = await lookupRes.json();
+
+    console.log('LOOKUP STATUS:', lookupRes.status, 'RESPONSE:', JSON.stringify(lookup));
 
     if (!lookup.total) {
       return res.status(404).json({
-        error_message: "We couldn't match this to an existing account. Please double check your Account/Customer ID or registered mobile number."
+        error_message: "We couldn't match this to an existing account. Please double check your registered mobile number."
       });
     }
 
