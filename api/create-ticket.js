@@ -55,6 +55,18 @@ export default async function handler(req, res) {
     // ---- Step 2: build a description from every submitted form field ----
     const specifyIssue = data['Specify issue'];
 
+    // Map the "Specify issue" form option to Zyro's sub_category_id (from
+    // GET /api/v2/ticket-taxonomy). Keyword-based so it still matches even
+    // if Webflow sends a slightly different slug/label than expected.
+    function mapSubCategoryId(issueValue) {
+      const v = (issueValue || '').toLowerCase();
+      if (v.includes('intermittent') || v.includes('drop')) return 13; // Frequent disconnection
+      if (v.includes('wifi') || v.includes('wi-fi') || v.includes('one device')) return 16; // LAN/WIFI issue
+      if (v.includes('no internet') || v.includes('all device') || v.includes('no access')) return 14; // Unable to browse
+      return 14; // default fallback: Unable to browse
+    }
+    const sub_category_id = mapSubCategoryId(specifyIssue);
+
     // Fields we don't want repeated in the free-text body (already used
     // elsewhere, or not useful to a support agent reading the ticket).
     const EXCLUDE_FROM_DESCRIPTION = new Set(['Privacy Policy']);
@@ -78,9 +90,8 @@ export default async function handler(req, res) {
         priority: (data.issue_type === 'no_internet' || specifyIssue === 'completely_no_internet')
           ? 'high'
           : 'medium',
+        sub_category_id,
         source: 'portal'
-        // sub_category_id intentionally left out for now — add once you've
-        // pulled real IDs from GET /api/v2/ticket-taxonomy
       })
     });
 
