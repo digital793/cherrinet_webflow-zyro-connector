@@ -11,6 +11,13 @@
 // form's list deletes that webhook globally, not just for that form. Using
 // a single shared URL for every form avoids ever needing to pick/remove
 // destinations per form again.
+//
+// FIELD NAMES CONFIRMED 2026-07-20 from the "New Connection Form" RAW
+// WEBFLOW PAYLOAD log: Name, Phone Number, Email, Pin Code, District,
+// Preferred Plan, ADD on, Privacy Policy. The "business" and "question"
+// tabs on /support-form have NOT been confirmed yet — their field names
+// below are still best-guess placeholders. Verify those the same way once
+// you have a raw payload log for each.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -147,10 +154,12 @@ async function handleTicket(data, res) {
 // =====================================================================
 async function handleLead(data, res) {
   const ZYRO_BASE = process.env.ZYRO_BASE_URL;
-  const LEADS_API_KEY = process.env.ZYRO_LEADS_API_KEY;
+  // Reusing the same key as the ticket path — this service account
+  // ("Website") now carries both create_tickets and create_leads_via_api.
+  const LEADS_API_KEY = process.env.ZYRO_API_KEY;
 
   if (!ZYRO_BASE || !LEADS_API_KEY) {
-    console.error('Missing ZYRO_BASE_URL or ZYRO_LEADS_API_KEY environment variable');
+    console.error('Missing ZYRO_BASE_URL or ZYRO_API_KEY environment variable');
     return res.status(500).json({ error: 'server_misconfigured' });
   }
 
@@ -160,6 +169,9 @@ async function handleLead(data, res) {
   };
 
   // ---- Step 1: figure out which of the 3 lead forms this came from ----
+  // NOTE: 'business' and 'question' field names below are still
+  // UNVERIFIED placeholders. Only 'new_connection' has been confirmed
+  // against a real payload (2026-07-20).
   let formType;
   if (data['Company name'] || data['Industry'] || data['Designation'] || data['Work email']) {
     formType = 'business';
@@ -173,6 +185,7 @@ async function handleLead(data, res) {
   let name, phone, email, address, pincode, notesExtra, campaign, banner;
 
   if (formType === 'business') {
+    // UNVERIFIED — confirm real field names before relying on this branch.
     campaign = 'business_ill';
     banner   = '*** BUSINESS LEAD (ILL) ***';
     name    = data['Full name'] || data['Company name'];
@@ -182,6 +195,7 @@ async function handleLead(data, res) {
     address = data['District'] ? `District: ${data['District']}` : undefined;
     notesExtra = `Company: ${data['Company name'] || ''}\nIndustry: ${data['Industry'] || ''}\nGSTIN: ${data['GSTIN'] || ''}\nDesignation: ${data['Designation'] || ''}`;
   } else if (formType === 'question') {
+    // UNVERIFIED — confirm real field names before relying on this branch.
     campaign = 'general_question';
     banner   = '*** GENERAL QUESTION ***';
     name    = data['Full name'];
@@ -189,14 +203,15 @@ async function handleLead(data, res) {
     email   = data['Email address'];
     notesExtra = `Question: ${data['Ask your question'] || ''}`;
   } else {
+    // CONFIRMED 2026-07-20 against the "New Connection Form" payload.
     campaign = 'new_connection_residential';
     banner   = '*** RESIDENTIAL / NEW CONNECTION LEAD ***';
-    name    = data['Full name'];
-    phone   = data['Mobile number'];
-    email   = data['Email address'];
-    pincode = data['PIN code'];
+    name    = data['Name'];
+    phone   = data['Phone Number'];
+    email   = data['Email'];
+    pincode = data['Pin Code'];
     address = data['District'] ? `District: ${data['District']}` : undefined;
-    notesExtra = `Preferred plan: ${data['Preferred plan'] || ''}\nOTT add-on: ${data['Choose your OTT add on'] || data['OTT add on'] || ''}`;
+    notesExtra = `Preferred plan: ${data['Preferred Plan'] || ''}\nOTT add-on: ${data['ADD on'] || ''}`;
   }
 
   if (!phone) {
