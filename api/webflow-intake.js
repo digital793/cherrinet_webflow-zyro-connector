@@ -24,6 +24,20 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
+  // ---- Chatbot payloads look like { type: 'Complaint', fields: {...} } ----
+  // Webflow payloads look like { name, site, data: {...}, ... }.
+  // Check for the bot shape FIRST so it never falls through into the
+  // Webflow-field-sniffing logic below.
+  if (req.body && req.body.type && req.body.fields) {
+    console.log('RAW BOT PAYLOAD:', JSON.stringify(req.body));
+    try {
+      return await handleBotSubmission(req.body.type, req.body.fields, res);
+    } catch (err) {
+      console.error('Unexpected error (bot path):', err);
+      return res.status(500).json({ error: 'internal_error' });
+    }
+  }
+
   const data = req.body.data || req.body;
 
   // TEMPORARY DEBUG LOG — safe to keep short-term while confirming routing;
@@ -262,5 +276,212 @@ async function handleLead(data, res) {
   }
 
   console.error('Zyro lead create failed:', leadRes.status, lead);
+  return res.status(500).json({ error: 'lead_creation_failed' });
+}
+
+// =====================================================================
+// CHATBOT path — cherri.html widget → this same Vercel endpoint
+// Payload shape: { type: 'Complaint' | 'Direct Enquiry' | 'New Connection'
+//                       | 'Business ILL Enquiry' | 'Coverage Notify',
+//                   fields: { ...whatever that flow collected } }
+// =====================================================================
+async function handleBotSubmission(type, fields, res) {
+  if (type === 'Complaint') {
+    return await handleBotComplaint(fields, res);
+  }
+  return await handleBotLead(type, fields, res);
+}
+
+// ---- Bot Complaint → POST /api/v2/tickets ----
+async function handleBotComplaint(fields, res) {
+  const ZYRO_BASE = process.env.ZYRO_BASE_URL;
+  const API_KEY   = process.env.ZYRO_API_KEY;
+
+  if (!ZYRO_BASE || !API_KEY) {
+    console.error('Missing ZYRO_BASE_URL or ZYRO_API_KEY environment variable');
+    return res.status(500).json({ error: 'server_misconfigured' });
+  }
+
+  const headers = {
+    'Authorization': `Bearer ${API_KEY}`,
+    'Content-Type': 'application/json'
+  };
+
+  const phone = fields['Mobile'];
+  if (!phone) {
+    return res.status(400).json({ error: 'missing_identifier' });
+  }
+
+  const lookupUrl = `${ZYRO_BASE}/api/v1/subscribers?phone=${encodeURIComponent(phone)}`;
+  const lookupRes = await fetch(lookupUrl, { headers });
+  const lookup = await lookupRes.json();
+
+  console.log('BOT LOOKUP STATUS:', lookupRes.status, 'RESPONSE:', JSON.stringify(lookup));
+
+  if (!lookup.total) {
+    return res.status(404).json({
+      error_message: "We couldn't match this to an existing account. Please double check your registered mobile number."
+    });
+  }
+
+  const subscriber_id = lookup.data[0].id;
+
+  function mapSubCategoryId(issueType) {
+    const v = (issueType || '').toLowerCase();
+    if (v.includes('slow') || v.includes('drop')) return 13;       // Frequent disconnection
+    if (v.includes('router') || v.includes('hardware')) return 16; // LAN/WIFI issue
+    if (v.includes('no internet') || v.includes('disconnection')) return 14; // Unable to browse
+    return 14; // default fallback
+  }
+  const sub_category_id = mapSubCategoryId(fields['Issue Type']);
+
+  function mapPriority(urgency) {
+    const v = (urgency || '').toLowerCase();
+    if (v === 'high') return 'high';
+    if (v === 'low') return 'low';
+    return 'medium';
+  }
+
+  const description = Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== '' && value !== '—')
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('\n');
+
+  const ticketRes = await fetch(`${ZYRO_BASE}/api/v2/tickets`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      subscriber_id,
+      subject: fields['Issue Type'] || 'Support request via chatbot',
+      description,
+      sub_category_id,
+      priority: mapPriority(fields['Urgency']),
+      source: 'portal'
+    })
+  });
+
+  const ticket = await ticketRes.json();
+  console.log('BOT TICKET CREATE STATUS:', ticketRes.status, JSON.stringify(ticket));
+
+  if (ticketRes.status === 201) {
+    return res.status(200).json({ ok: true, ticket_number: ticket.data.ticket_number });
+  }
+
+  if (ticketRes.status === 409) {
+    return res.status(409).json({
+      error_message: `You already have an open ticket (${ticket.existing.ticket_number}). Our team is already on it.`
+    });
+  }
+
+  console.error('Zyro bot ticket create failed:', ticketRes.status, ticket);
+  return res.status(500).json({ error: 'ticket_creation_failed' });
+}
+
+// ---- Bot leads (4 flows) → POST /api/v2/webhooks/leads ----
+async function handleBotLead(type, fields, res) {
+  const ZYRO_BASE = process.env.ZYRO_BASE_URL;
+  const API_KEY   = process.env.ZYRO_API_KEY; // same key, carries both permissions
+
+  if (!ZYRO_BASE || !API_KEY) {
+    console.error('Missing ZYRO_BASE_URL or ZYRO_API_KEY environment variable');
+    return res.status(500).json({ error: 'server_misconfigured' });
+  }
+
+  const headers = {
+    'Authorization': `Bearer ${API_KEY}`,
+    'Content-Type': 'application/json'
+  };
+
+  let name, phone, email, address, pincode, campaign, banner;
+
+  switch (type) {
+    case 'Direct Enquiry':
+      campaign = 'bot_direct_enquiry';
+      banner   = '*** DIRECT ENQUIRY (CHATBOT) ***';
+      name     = fields['Name'];
+      phone    = fields['Mobile'];
+      email    = fields['Email'] !== '—' ? fields['Email'] : undefined;
+      address  = fields['Area'];
+      break;
+
+    case 'New Connection':
+      campaign = 'bot_new_connection';
+      banner   = '*** NEW CONNECTION (CHATBOT) ***';
+      name     = fields['Name'];
+      phone    = fields['Mobile'];
+      email    = fields['Email'] !== '—' ? fields['Email'] : undefined;
+      pincode  = fields['PIN'];
+      address  = fields['Address'];
+      break;
+
+    case 'Business ILL Enquiry':
+      campaign = 'bot_business_ill';
+      banner   = '*** BUSINESS ILL ENQUIRY (CHATBOT) ***';
+      name     = fields['Contact Name'] || fields['Company Name'];
+      phone    = fields['Mobile'] || fields['Alternate Phone'];
+      email    = fields['Work Email'];
+      pincode  = fields['PIN Code'];
+      address  = fields['District'] ? `District: ${fields['District']}` : undefined;
+      break;
+
+    case 'Coverage Notify':
+      campaign = 'bot_coverage_notify';
+      banner   = '*** COVERAGE NOTIFY (CHATBOT) ***';
+      name     = fields['Name'];
+      phone    = fields['Mobile'];
+      pincode  = fields['PIN'];
+      break;
+
+    default:
+      // Unknown bot flow type — still try to capture something rather than
+      // silently dropping the submission.
+      campaign = 'bot_other';
+      banner   = `*** ${type || 'UNKNOWN'} (CHATBOT) ***`;
+      name     = fields['Name'] || fields['Contact Name'];
+      phone    = fields['Mobile'];
+      email    = fields['Email'];
+  }
+
+  if (!phone) {
+    return res.status(400).json({ error: 'missing_phone' });
+  }
+
+  const fullDump = Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== '' && value !== '—')
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('\n');
+
+  const notes = `${banner}\n\n${fullDump}`;
+
+  const leadRes = await fetch(`${ZYRO_BASE}/api/v2/webhooks/leads`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      name: name || 'Chatbot enquiry',
+      phone,
+      email: email || undefined,
+      address,
+      pincode,
+      source: 'website',
+      campaign,
+      notes
+    })
+  });
+
+  const lead = await leadRes.json();
+  console.log('BOT LEAD CREATE STATUS:', leadRes.status, JSON.stringify(lead));
+
+  if (leadRes.status === 201) {
+    return res.status(200).json({ ok: true, lead_id: lead.id, message: lead.message });
+  }
+
+  if (leadRes.status === 422) {
+    return res.status(422).json({
+      error_message: 'Please check your details and try again.',
+      details: lead.details
+    });
+  }
+
+  console.error('Zyro bot lead create failed:', leadRes.status, lead);
   return res.status(500).json({ error: 'lead_creation_failed' });
 }
