@@ -20,6 +20,21 @@
 // you have a raw payload log for each.
 
 export default async function handler(req, res) {
+  // ---- CORS ----
+  // Webflow FORM submissions happen server-side (Webflow calls this
+  // webhook directly), so they never hit CORS. The chatbot is different:
+  // it runs client-side JS in the visitor's browser, so fetch() from
+  // cherrinet-commercial.webflow.io to this Vercel domain is cross-origin.
+  // The browser sends an OPTIONS preflight first; without these headers
+  // it gets rejected before the real POST is ever sent.
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'method_not_allowed' });
   }
