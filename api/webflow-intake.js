@@ -185,15 +185,15 @@ async function handleLead(data, res) {
   let name, phone, email, address, pincode, notesExtra, campaign, banner;
 
   if (formType === 'business') {
-    // UNVERIFIED — confirm real field names before relying on this branch.
+    // CONFIRMED 2026-07-20 against the "Business Enquiry" payload.
     campaign = 'business_ill';
     banner   = '*** BUSINESS LEAD (ILL) ***';
-    name    = data['Full name'] || data['Company name'];
-    phone   = data['Mobile number'] || data['Alternate phone'];
-    email   = data['Work email'];
-    pincode = data['PIN code'];
+    name    = data['Name'] || data['Company name'];
+    phone   = data['Phone Number'] || data['Alternative Phone Number'];
+    email   = data['Email'];
+    pincode = data['Pin Code'];
     address = data['District'] ? `District: ${data['District']}` : undefined;
-    notesExtra = `Company: ${data['Company name'] || ''}\nIndustry: ${data['Industry'] || ''}\nGSTIN: ${data['GSTIN'] || ''}\nDesignation: ${data['Designation'] || ''}`;
+    notesExtra = `Company: ${data['Company name'] || ''}\nIndustry: ${data['Industry'] || ''}\nGSTIN: ${data['GSTIN (optional)'] || ''}\nDesignation: ${data['Designation'] || ''}`;
   } else if (formType === 'question') {
     // UNVERIFIED — confirm real field names before relying on this branch.
     campaign = 'general_question';
