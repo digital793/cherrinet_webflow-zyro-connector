@@ -109,7 +109,7 @@ export default async function handler(req, res) {
           name,
           phone,
           email: email && email !== 'test@meta.com' ? email : undefined,
-          source: 'meta_lead_ads',
+          source: 'website',
           campaign: 'meta_lead_ads_sheet',
           notes
         })
