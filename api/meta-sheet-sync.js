@@ -10,11 +10,16 @@
 // as often as you like for testing, since it tracks which lead `id`s it
 // has already synced (via Vercel KV) and skips them on every re-run.
 //
-// SHEET COLUMNS (confirmed from the live sheet on 2026-07-30):
+// SHEET COLUMNS (confirmed from the live sheet "Cherriner Pincode CRM
+// setup" on 2026-07-31):
 //   id, created_time, ad_id, ad_name, adset_id, adset_name, campaign_id,
 //   campaign_name, form_id, form_name, is_organic, platform,
 //   which_plan_are_you_interested_in?, email_address, phone_number,
-//   first_name, lead_status
+//   first_name, zip_code, lead_status
+//
+//   NOTE: zip_code is a new column added between first_name and
+//   lead_status. Like phone_number (prefixed "p:"), Meta prefixes it with
+//   "z:" (e.g. "z:638008") — stripped by normalizeZip() below.
 //
 // SETUP NEEDED:
 //   1. Vercel dashboard → Storage → Create Database → KV. Connect it to
@@ -33,7 +38,7 @@
 import { kv } from '@vercel/kv';
 import Papa from 'papaparse';
 
-const SHEET_ID = '1n-exNxlpQmpe8O9GhrSKhL9rCB-6GI_FN0zK-QS6qi8';
+const SHEET_ID = '1llrl-ZjcjuFn6cCtPv0Q_N9V233s_SFgFiHw8OobePg';
 const CSV_URL = process.env.GOOGLE_SHEET_CSV_URL
   || `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv`;
 
@@ -89,10 +94,12 @@ export default async function handler(req, res) {
     const name = row['first_name'] || 'Meta Lead Ad enquiry';
     const email = row['email_address'];
     const plan = row['which_plan_are_you_interested_in?'];
+    const zip = normalizeZip(row['zip_code']);
 
     const notes = [
       '*** META LEAD AD (via Google Sheet sync) ***',
       `Plan interest: ${plan || ''}`,
+      `Zip code: ${zip || ''}`,
       '',
       '--- Full row ---',
       Object.entries(row).map(([k, v]) => `${k}: ${v}`).join('\n')
@@ -109,6 +116,7 @@ export default async function handler(req, res) {
           name,
           phone,
           email: email && email !== 'test@meta.com' ? email : undefined,
+          zip_code: zip || undefined,
           source: 'website',
           campaign: 'meta_lead_ads_sheet',
           notes
@@ -141,6 +149,15 @@ export default async function handler(req, res) {
 function normalizePhone(raw) {
   if (!raw) return null;
   const cleaned = raw.replace(/^p:/, '').trim();
+  if (!cleaned || cleaned.startsWith('<test lead')) return null; // Meta's dummy test row
+  return cleaned;
+}
+
+// Same deal as phone: Meta prefixes zip_code values with "z:" (visible in
+// the test row, e.g. "z:638008"). Strip that and ignore the dummy test row.
+function normalizeZip(raw) {
+  if (!raw) return null;
+  const cleaned = raw.replace(/^z:/, '').trim();
   if (!cleaned || cleaned.startsWith('<test lead')) return null; // Meta's dummy test row
   return cleaned;
 }
