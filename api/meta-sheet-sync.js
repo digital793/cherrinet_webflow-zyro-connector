@@ -210,12 +210,3 @@ function normalizeZip(raw) {
   if (!cleaned || cleaned.startsWith('<test lead')) return null; // Meta's dummy test row
   return cleaned;
 }
-
-// Same deal as phone: Meta prefixes zip_code values with "z:" (visible in
-// the test row, e.g. "z:638008"). Strip that and ignore the dummy test row.
-function normalizeZip(raw) {
-  if (!raw) return null;
-  const cleaned = raw.replace(/^z:/, '').trim();
-  if (!cleaned || cleaned.startsWith('<test lead')) return null; // Meta's dummy test row
-  return cleaned;
-}
