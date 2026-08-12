@@ -4,11 +4,17 @@
 // Sheets" lead sync — no Meta Developer App / webhook needed) and creates
 // a Zyro lead for every row we haven't processed yet.
 //
-// WHY POLLING INSTEAD OF A WEBHOOK: a spreadsheet can't push notifications
-// to us — we have to periodically re-check it. This function is designed
-// to be called on a schedule (Vercel Cron) AND to be safe to call manually
-// as often as you like for testing, since it tracks which lead `id`s it
-// has already synced (via Vercel KV) and skips them on every re-run.
+// NOTE: this endpoint is triggered by an event-driven Apps Script
+// (onChange) living inside the Google Sheet itself, not by a fixed
+// schedule. See meta-sync-trigger.gs. Still safe to call manually any
+// time, since it tracks which lead `id`s it has already synced (via
+// Supabase Postgres) and skips them on every re-run.
+//
+// DB USAGE — switched from Upstash Redis (Vercel KV) to Supabase
+// Postgres. Same efficiency pattern as before: we load the FULL set of
+// already-synced lead ids in ONE query at the top of the run, and write
+// all newly-synced ids in ONE batch insert at the end — never one query
+// per row. Do not reintroduce a per-row DB call here.
 //
 // SHEET COLUMNS (confirmed from the live sheet "Cherriner Pincode CRM
 // setup" on 2026-07-31):
@@ -22,20 +28,25 @@
 //   "z:" (e.g. "z:638008") — stripped by normalizeZip() below.
 //
 // SETUP NEEDED:
-//   1. Vercel dashboard → Storage → Create Database → KV. Connect it to
-//      this project. This auto-adds KV_REST_API_URL / KV_REST_API_TOKEN
-//      env vars — no manual copying needed.
-//   2. `npm install @vercel/kv papaparse` in your project.
-//   3. Env var GOOGLE_SHEET_CSV_URL — the export URL below, built from
+//   1. In Supabase SQL Editor, run:
+//        create table synced_leads (
+//          lead_id text primary key,
+//          synced_at timestamp default now()
+//        );
+//   2. `npm install @supabase/supabase-js` in your project.
+//   3. Env vars (already added to Vercel via the Supabase integration):
+//        NEXT_PUBLIC_SUPABASE_URL
+//        SUPABASE_SERVICE_ROLE_KEY   <-- required, NOT the anon key.
+//          The service role key is needed because this runs server-side
+//          and must bypass Row Level Security to read/write the
+//          synced_leads table. Never expose this key to the browser —
+//          it's only used here, inside a serverless function.
+//   4. Env var GOOGLE_SHEET_CSV_URL — the export URL below, built from
 //      your sheet's ID (already filled in from the link you shared).
-//   4. Add a Vercel Cron entry in vercel.json (see note at bottom of this
-//      file) to call this endpoint automatically every few minutes.
-//      NOTE: Hobby-plan Vercel projects only allow daily cron jobs, not
-//      every-few-minutes. Until/unless you're on Pro, call this endpoint
-//      manually (or via a free external scheduler like cron-job.org) for
-//      near-real-time syncing.
+//   5. Sync is triggered by meta-sync-trigger.gs (installed inside the
+//      Google Sheet via Extensions > Apps Script) — see that file.
 
-import { kv } from '@vercel/kv';
+import { createClient } from '@supabase/supabase-js';
 import Papa from 'papaparse';
 
 const SHEET_ID = '1llrl-ZjcjuFn6cCtPv0Q_N9V233s_SFgFiHw8OobePg';
@@ -43,18 +54,26 @@ const CSV_URL = process.env.GOOGLE_SHEET_CSV_URL
   || `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv`;
 
 export default async function handler(req, res) {
-  // Allow both GET (manual browser trigger / Vercel Cron) and POST.
+  // Allow both GET (manual browser trigger / Apps Script call) and POST.
   if (req.method !== 'GET' && req.method !== 'POST') {
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
   const ZYRO_BASE = process.env.ZYRO_BASE_URL;
   const API_KEY   = process.env.ZYRO_API_KEY;
+  const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   if (!ZYRO_BASE || !API_KEY) {
     console.error('Missing ZYRO_BASE_URL or ZYRO_API_KEY environment variable');
     return res.status(500).json({ error: 'server_misconfigured' });
   }
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    console.error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable');
+    return res.status(500).json({ error: 'server_misconfigured' });
+  }
+
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
   // ---- Step 1: fetch + parse the sheet ----
   const csvRes = await fetch(CSV_URL);
@@ -69,24 +88,40 @@ export default async function handler(req, res) {
 
   console.log(`META SHEET SYNC: fetched ${rows.length} row(s)`);
 
+  // ---- Step 2: load the FULL synced-leads set in ONE query ----
+  // (Replaces the old Redis kv.smembers call.)
+  const { data: syncedRows, error: readErr } = await supabase
+    .from('synced_leads')
+    .select('lead_id');
+
+  if (readErr) {
+    console.error('META SHEET SYNC: failed to read synced_leads from Supabase', readErr);
+    return res.status(502).json({ error: 'db_read_failed' });
+  }
+
+  const syncedSet = new Set((syncedRows || []).map(r => r.lead_id));
+
+  // Collect ids that need to be added to the synced set. We batch these
+  // into a single insert at the end instead of one write per lead.
+  const newlySyncedIds = [];
+
   let created = 0, skipped = 0, failed = 0;
 
   for (const row of rows) {
     const leadId = row['id'];
     if (!leadId) continue; // blank row
 
-    // ---- Step 2: skip if we've already synced this lead ----
-    const alreadyProcessed = await kv.sismember('meta_leads_synced', leadId);
-    if (alreadyProcessed) {
+    // ---- Step 3: skip if we've already synced this lead (in-memory check) ----
+    if (syncedSet.has(leadId)) {
       skipped++;
       continue;
     }
 
-    // ---- Step 3: map row → Zyro lead payload ----
+    // ---- Step 4: map row → Zyro lead payload ----
     const phone = normalizePhone(row['phone_number']);
     if (!phone) {
       console.warn('META SHEET SYNC: row has no usable phone, skipping', JSON.stringify(row));
-      await kv.sadd('meta_leads_synced', leadId); // don't retry a bad row forever
+      newlySyncedIds.push(leadId); // don't retry a bad row forever
       skipped++;
       continue;
     }
@@ -127,7 +162,7 @@ export default async function handler(req, res) {
       console.log('META SHEET SYNC: lead create', leadId, leadRes.status, JSON.stringify(lead));
 
       if (leadRes.status === 201) {
-        await kv.sadd('meta_leads_synced', leadId);
+        newlySyncedIds.push(leadId);
         created++;
       } else {
         // Don't mark as processed — we'll retry it next sync.
@@ -137,6 +172,20 @@ export default async function handler(req, res) {
     } catch (err) {
       console.error('META SHEET SYNC: error creating lead for', leadId, err);
       failed++;
+    }
+  }
+
+  // ---- Step 5: persist all newly-synced ids in ONE batch insert ----
+  if (newlySyncedIds.length > 0) {
+    const { error: writeErr } = await supabase
+      .from('synced_leads')
+      .insert(newlySyncedIds.map(id => ({ lead_id: id })));
+
+    if (writeErr) {
+      // If this fails, these leads may be re-attempted next run. Safe
+      // for the "bad row" skips; for real creates, this should be rare
+      // since it's a single batched request.
+      console.error('META SHEET SYNC: failed to persist synced ids to Supabase', writeErr);
     }
   }
 
@@ -162,12 +211,11 @@ function normalizeZip(raw) {
   return cleaned;
 }
 
-// ---- vercel.json cron entry (add this to your project's vercel.json) ----
-// {
-//   "crons": [
-//     { "path": "/api/meta-sheet-sync", "schedule": "0 */6 * * *" }
-//   ]
-// }
-// "0 */6 * * *" = every 6 hours, which is the max frequency allowed on
-// Vercel's Hobby plan. On Pro you can go as low as every minute
-// ("*/5 * * * *" for every 5 minutes) if you need faster syncing.
+// Same deal as phone: Meta prefixes zip_code values with "z:" (visible in
+// the test row, e.g. "z:638008"). Strip that and ignore the dummy test row.
+function normalizeZip(raw) {
+  if (!raw) return null;
+  const cleaned = raw.replace(/^z:/, '').trim();
+  if (!cleaned || cleaned.startsWith('<test lead')) return null; // Meta's dummy test row
+  return cleaned;
+}
