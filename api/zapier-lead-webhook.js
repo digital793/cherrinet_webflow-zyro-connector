@@ -108,7 +108,7 @@ export default async function handler(req, res) {
         name,
         phone,
         email,
-        zip_code: zip || undefined,
+        pincode: zip || undefined,
         source: 'website',
         campaign: 'meta_lead_ads_zapier',
         notes
