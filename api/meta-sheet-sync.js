@@ -88,16 +88,39 @@ export default async function handler(req, res) {
 
   console.log(`META SHEET SYNC: fetched ${rows.length} row(s)`);
 
-  // ---- Step 2: load the FULL synced-leads set in ONE query ----
+  // ---- Step 2: load the FULL synced-leads set, paginated ----
   // (Replaces the old Redis kv.smembers call.)
-  const { data: syncedRows, error: readErr } = await supabase
-    .from('synced_leads')
-    .select('lead_id');
+  //
+  // IMPORTANT: Supabase's REST API caps any select() at 1000 rows per
+  // request by default, regardless of how many rows actually match. Once
+  // synced_leads grew past 1000 rows, a single unpaginated select() here
+  // silently returned only the first 1000 — so ~200+ already-synced leads
+  // were missing from syncedSet, got treated as "new", got RECREATED in
+  // Zyro, and then the batch insert below failed on a duplicate primary
+  // key (lead_id already existed), which killed persistence for the
+  // entire run's newly-synced ids (including genuinely new leads). This
+  // loop fetches every page instead of trusting one call to return
+  // everything.
+  const PAGE_SIZE = 1000;
+  let syncedRows = [];
+  for (let page = 0; ; page++) {
+    const from = page * PAGE_SIZE;
+    const to = from + PAGE_SIZE - 1;
+    const { data: pageRows, error: readErr } = await supabase
+      .from('synced_leads')
+      .select('lead_id')
+      .range(from, to);
 
-  if (readErr) {
-    console.error('META SHEET SYNC: failed to read synced_leads from Supabase', readErr);
-    return res.status(502).json({ error: 'db_read_failed' });
+    if (readErr) {
+      console.error('META SHEET SYNC: failed to read synced_leads from Supabase', readErr);
+      return res.status(502).json({ error: 'db_read_failed' });
+    }
+
+    syncedRows = syncedRows.concat(pageRows);
+    if (pageRows.length < PAGE_SIZE) break; // last page reached
   }
+
+  console.log(`META SHEET SYNC: loaded ${syncedRows.length} already-synced lead id(s) from Supabase`);
 
   const syncedSet = new Set((syncedRows || []).map(r => r.lead_id));
 
