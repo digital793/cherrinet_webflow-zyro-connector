@@ -151,7 +151,12 @@ export default async function handler(req, res) {
           name,
           phone,
           email: email && email !== 'test@meta.com' ? email : undefined,
-          zip_code: zip || undefined,
+          pincode: zip || undefined, // Zyro's leads schema expects "pincode", not "zip_code" —
+                                      // confirmed against create-lead.js / webflow-intake.js,
+                                      // which both use "pincode" successfully. Sending
+                                      // "zip_code" was a field-name mismatch Zyro silently
+                                      // ignored, which is why the Pincode field stayed blank
+                                      // on synced leads even though notes had the right value.
           source: 'website',
           campaign: 'meta_lead_ads_sheet',
           notes
@@ -193,13 +198,36 @@ export default async function handler(req, res) {
   return res.status(200).json({ ok: true, created, skipped, failed, totalRows: rows.length });
 }
 
-// Meta's sheet sometimes prefixes phone values with "p:" (visible in the
-// test row) — strip that and any stray whitespace before sending to Zyro.
+// Meta's sheet usually prefixes phone values with "p:+91..." (visible in
+// most rows), but we've seen at least one row come through as bare digits
+// with neither the "p:" prefix nor the "+" (e.g. "8428068041" or
+// "918428068041" instead of "p:+918428068041") — so this normalizes to a
+// consistent "+91XXXXXXXXXX" output regardless of what the source row
+// actually contains, instead of just stripping "p:" and hoping the rest
+// is already well-formed.
 function normalizePhone(raw) {
   if (!raw) return null;
-  const cleaned = raw.replace(/^p:/, '').trim();
+  let cleaned = raw.replace(/^p:/, '').trim();
   if (!cleaned || cleaned.startsWith('<test lead')) return null; // Meta's dummy test row
-  return cleaned;
+
+  // Strip everything except digits and a leading +, so we can reason
+  // about the digit count regardless of stray spaces/dashes.
+  const digitsOnly = cleaned.replace(/[^\d+]/g, '');
+
+  if (digitsOnly.startsWith('+')) {
+    return digitsOnly; // already has a country code — trust it
+  }
+  if (digitsOnly.length === 10) {
+    return '+91' + digitsOnly; // bare 10-digit Indian mobile number
+  }
+  if (digitsOnly.length === 12 && digitsOnly.startsWith('91')) {
+    return '+' + digitsOnly; // has "91" country code but no "+"
+  }
+
+  // Anything else is a shape we haven't seen before — log it and pass
+  // through as-is rather than silently mangling it further.
+  console.warn('META SHEET SYNC: unrecognized phone format, passing through as-is:', raw);
+  return digitsOnly || cleaned;
 }
 
 // Same deal as phone: Meta prefixes zip_code values with "z:" (visible in
