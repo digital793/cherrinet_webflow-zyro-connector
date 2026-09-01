@@ -4,28 +4,35 @@
 // Sheets" lead sync — no Meta Developer App / webhook needed) and creates
 // a Zyro lead for every row we haven't processed yet.
 //
-// NOTE: this endpoint is triggered by an event-driven Apps Script
-// (onChange) living inside the Google Sheet itself, not by a fixed
-// schedule. See meta-sync-trigger.gs. Still safe to call manually any
-// time, since it tracks which lead `id`s it has already synced (via
-// Supabase Postgres) and skips them on every re-run.
+// NOTE: this endpoint is triggered by a time-based Apps Script trigger
+// living inside the Google Sheet itself (see meta-sync-trigger-timebased.gs).
+// An earlier onChange-based trigger was replaced because Google's onChange
+// is unreliable for edits made via API calls from external services (like
+// Meta's native Sheets integration writing rows programmatically) — it
+// sometimes missed new leads entirely. Still safe to call this endpoint
+// manually any time, since it tracks which lead `id`s it has already
+// synced (via Supabase Postgres) and skips them on every re-run.
 //
-// DB USAGE — switched from Upstash Redis (Vercel KV) to Supabase
-// Postgres. Same efficiency pattern as before: we load the FULL set of
-// already-synced lead ids in ONE query at the top of the run, and write
-// all newly-synced ids in ONE batch insert at the end — never one query
-// per row. Do not reintroduce a per-row DB call here.
+// DB USAGE — Supabase Postgres. We load the FULL set of already-synced
+// lead ids at the top of the run (paginated — see Step 2 note below), and
+// write all newly-synced ids in ONE batch insert at the end — never one
+// query per row. Do not reintroduce a per-row DB call here.
 //
-// SHEET COLUMNS (confirmed from the live sheet "Cherriner Pincode CRM
-// setup" on 2026-07-31):
+// SHEET COLUMNS (confirmed live against the sheet on this date — verify
+// again if you ever swap in a different sheet):
 //   id, created_time, ad_id, ad_name, adset_id, adset_name, campaign_id,
 //   campaign_name, form_id, form_name, is_organic, platform,
 //   which_plan_are_you_interested_in?, email_address, phone_number,
 //   first_name, zip_code, lead_status
 //
-//   NOTE: zip_code is a new column added between first_name and
-//   lead_status. Like phone_number (prefixed "p:"), Meta prefixes it with
-//   "z:" (e.g. "z:638008") — stripped by normalizeZip() below.
+//   NOTE: phone_number is prefixed "p:" and zip_code is prefixed "z:" by
+//   Meta's sheet sync — both stripped below. Real-world zip_code values
+//   have been seen containing junk (a full phone number, or text like
+//   "Chennai 600039" instead of a plain pincode) — normalizeZip() only
+//   strips the "z:" prefix and trims whitespace; it does NOT validate
+//   that what's left is actually a valid 6-digit Indian PIN code. If
+//   Zyro's pincode field needs to stay clean, consider adding stricter
+//   validation (e.g. reject non-6-digit values) — not currently done.
 //
 // SETUP NEEDED:
 //   1. In Supabase SQL Editor, run:
@@ -41,15 +48,24 @@
 //          and must bypass Row Level Security to read/write the
 //          synced_leads table. Never expose this key to the browser —
 //          it's only used here, inside a serverless function.
-//   4. Env var GOOGLE_SHEET_CSV_URL — the export URL below, built from
-//      your sheet's ID (already filled in from the link you shared).
-//   5. Sync is triggered by meta-sync-trigger.gs (installed inside the
-//      Google Sheet via Extensions > Apps Script) — see that file.
+//   4. Env var GOOGLE_SHEET_CSV_URL (RECOMMENDED — overrides SHEET_ID
+//      below without a code change/redeploy if the sheet ever moves
+//      again):
+//        GOOGLE_SHEET_CSV_URL=https://docs.google.com/spreadsheets/d/1MZoXtzObNZKsfaVvuT2W_5q7MAvD9Bl18CBR2IPXaWw/export?format=csv
+//   5. Confirm the sheet's Share setting is "Anyone with the link can
+//      view" — the CSV export URL only works without login if so.
+//   6. Sync is triggered by meta-sync-trigger-timebased.gs (installed
+//      inside the Google Sheet via Extensions > Apps Script) — see that
+//      file. Must be installed fresh in THIS sheet (Apps Script
+//      projects are per-spreadsheet, not shared across sheets).
 
 import { createClient } from '@supabase/supabase-js';
 import Papa from 'papaparse';
 
-const SHEET_ID = '1llrl-ZjcjuFn6cCtPv0Q_N9V233s_SFgFiHw8OobePg';
+// Updated to the new "Cherrinet Meta Leads" sheet (previously pointed at
+// the old "Cherriner Pincode CRM setup" sheet). If GOOGLE_SHEET_CSV_URL
+// is set in Vercel env vars, that takes precedence over this hardcoded ID.
+const SHEET_ID = '1MZoXtzObNZKsfaVvuT2W_5q7MAvD9Bl18CBR2IPXaWw';
 const CSV_URL = process.env.GOOGLE_SHEET_CSV_URL
   || `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv`;
 
@@ -89,18 +105,13 @@ export default async function handler(req, res) {
   console.log(`META SHEET SYNC: fetched ${rows.length} row(s)`);
 
   // ---- Step 2: load the FULL synced-leads set, paginated ----
-  // (Replaces the old Redis kv.smembers call.)
-  //
-  // IMPORTANT: Supabase's REST API caps any select() at 1000 rows per
-  // request by default, regardless of how many rows actually match. Once
-  // synced_leads grew past 1000 rows, a single unpaginated select() here
-  // silently returned only the first 1000 — so ~200+ already-synced leads
-  // were missing from syncedSet, got treated as "new", got RECREATED in
-  // Zyro, and then the batch insert below failed on a duplicate primary
-  // key (lead_id already existed), which killed persistence for the
-  // entire run's newly-synced ids (including genuinely new leads). This
-  // loop fetches every page instead of trusting one call to return
-  // everything.
+  // Supabase's REST API caps any select() at 1000 rows per request by
+  // default, regardless of how many rows actually match. This loop fetches
+  // every page instead of trusting one call to return everything — see
+  // git history for the incident this fixed (unpaginated select() caused
+  // already-synced leads to be silently missed once the table passed
+  // 1000 rows, which led to duplicate-create attempts and a batch-insert
+  // failure on the resulting primary key conflict).
   const PAGE_SIZE = 1000;
   let syncedRows = [];
   for (let page = 0; ; page++) {
@@ -175,11 +186,7 @@ export default async function handler(req, res) {
           phone,
           email: email && email !== 'test@meta.com' ? email : undefined,
           pincode: zip || undefined, // Zyro's leads schema expects "pincode", not "zip_code" —
-                                      // confirmed against create-lead.js / webflow-intake.js,
-                                      // which both use "pincode" successfully. Sending
-                                      // "zip_code" was a field-name mismatch Zyro silently
-                                      // ignored, which is why the Pincode field stayed blank
-                                      // on synced leads even though notes had the right value.
+                                      // confirmed against create-lead.js / webflow-intake.js.
           source: 'website',
           campaign: 'meta_lead_ads_sheet',
           notes
@@ -222,9 +229,8 @@ export default async function handler(req, res) {
 }
 
 // Meta's sheet usually prefixes phone values with "p:+91..." (visible in
-// most rows), but we've seen at least one row come through as bare digits
-// with neither the "p:" prefix nor the "+" (e.g. "8428068041" or
-// "918428068041" instead of "p:+918428068041") — so this normalizes to a
+// most rows), but occasionally a row comes through as bare digits with
+// neither the "p:" prefix nor the "+" — so this normalizes to a
 // consistent "+91XXXXXXXXXX" output regardless of what the source row
 // actually contains, instead of just stripping "p:" and hoping the rest
 // is already well-formed.
@@ -254,7 +260,12 @@ function normalizePhone(raw) {
 }
 
 // Same deal as phone: Meta prefixes zip_code values with "z:" (visible in
-// the test row, e.g. "z:638008"). Strip that and ignore the dummy test row.
+// most rows, e.g. "z:638008"). Strip that and ignore the dummy test row.
+//
+// NOTE: does not validate that the remaining value is a real 6-digit PIN
+// code — some live rows have been seen with a full phone number or free
+// text (e.g. "Chennai 600039") in this field instead of a plain pincode.
+// Whatever is left after stripping "z:" is passed through as-is to Zyro.
 function normalizeZip(raw) {
   if (!raw) return null;
   const cleaned = raw.replace(/^z:/, '').trim();
