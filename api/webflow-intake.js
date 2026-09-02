@@ -14,10 +14,22 @@
 //
 // FIELD NAMES CONFIRMED 2026-07-20 from the "New Connection Form" RAW
 // WEBFLOW PAYLOAD log: Name, Phone Number, Email, Pin Code, District,
-// Preferred Plan, ADD on, Privacy Policy. The "business" and "question"
-// tabs on /support-form have NOT been confirmed yet — their field names
-// below are still best-guess placeholders. Verify those the same way once
-// you have a raw payload log for each.
+// Preferred Plan, ADD on, Privacy Policy.
+//
+// FIELD NAMES CONFIRMED 2026-09-02 directly from Webflow Designer field
+// settings (not just a payload log) for the New Connection tab:
+//   - Address  → Textarea field, Settings > Name = "Address"
+//   - Pin Code → Input field,    Settings > Name = "Pin Code" (Type: Number)
+// Note: the Designer "ID" shown for these fields (e.g. "Pin-Code-1") is
+// just an internal element ID and is NOT what gets submitted — the
+// submitted payload key is the "Name" field under Text/Textarea Field
+// settings. Only rely on ID vs Name confusion as a reason to re-check
+// Designer settings if a field ever goes missing again.
+//
+// The "business" and "question" tabs on /support-form have NOT been
+// confirmed yet the same way — their field names below are still
+// best-guess placeholders. Verify those the same way (Designer field
+// settings or a raw payload log) once you get to them.
 
 export default async function handler(req, res) {
   // ---- CORS ----
@@ -200,7 +212,8 @@ async function handleLead(data, res) {
   // ---- Step 1: figure out which of the 3 lead forms this came from ----
   // NOTE: 'business' and 'question' field names below are still
   // UNVERIFIED placeholders. Only 'new_connection' has been confirmed
-  // against a real payload (2026-07-20).
+  // against a real payload (2026-07-20) AND against Designer field
+  // settings (2026-09-02).
   let formType;
   if (data['Company name'] || data['Industry'] || data['Designation'] || data['Work email']) {
     formType = 'business';
@@ -232,15 +245,24 @@ async function handleLead(data, res) {
     email   = data['Email address'];
     notesExtra = `Question: ${data['Ask your question'] || ''}`;
   } else {
-    // CONFIRMED 2026-07-20 against the "New Connection Form" payload.
+    // CONFIRMED 2026-07-20 against the "New Connection Form" payload, and
+    // 2026-09-02 against Webflow Designer field settings:
+    //   Address  → Textarea, Name = "Address"
+    //   Pin Code → Input,    Name = "Pin Code"
+    // Address and District are kept as two separate submitted values and
+    // combined below — District is NOT a stand-in for the full address.
     campaign = 'new_connection_residential';
     banner   = '*** RESIDENTIAL / NEW CONNECTION LEAD ***';
     name    = data['Name'];
     phone   = data['Phone Number'];
     email   = data['Email'];
     pincode = data['Pin Code'];
-    address = data['District'] ? `District: ${data['District']}` : undefined;
-    notesExtra = `Preferred plan: ${data['Preferred Plan'] || ''}\nOTT add-on: ${data['ADD on'] || ''}`;
+
+    const streetAddress = data['Address'];
+    const district       = data['District'];
+    address = [streetAddress, district].filter(Boolean).join(', ') || undefined;
+
+    notesExtra = `Address: ${streetAddress || ''}\nDistrict: ${district || ''}\nPreferred plan: ${data['Preferred Plan'] || ''}\nOTT add-on: ${data['ADD on'] || ''}`;
   }
 
   if (!phone) {
