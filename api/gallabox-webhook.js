@@ -130,14 +130,13 @@ function buildLead(body) {
   ].join("\n");
 
   // Preserve the Zyro endpoint and payload structure used previously.
-  const payload = {
-    name,
-    phone,
-    ...(email ? { email } : {}),
-    source: "whatsapp",
-    campaign: "gallabox_whatsapp_high_priority",
-    notes,
-  };
+const payload = {
+  name,
+  phone,
+  ...(email ? { email } : {}),
+  campaign: "gallabox_whatsapp_high_priority",
+  notes,
+};
 
   return {
     payload,
