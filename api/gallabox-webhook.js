@@ -91,15 +91,35 @@ export default async function handler(req, res) {
     );
     const event = pick("event", "eventType", "event_type", "type");
 
-    if (!rawPhone) {
-      // Avoid logging personal information. Inspect the event structure
-      // in a safe test environment to identify the correct phone field.
-      console.error("Gallabox webhook missing phone; inspect payload schema");
-      return res.status(422).json({
-        error: "missing_phone",
-        message: "Map the phone field from the actual Gallabox payload.",
-      });
+
+if (!rawPhone) {
+  // Log field names and data types, NOT customer data.
+  function inspectShape(value, path = "body", depth = 0) {
+    if (depth > 5 || value == null) return [];
+
+    if (Array.isArray(value)) {
+      return value.length
+        ? inspectShape(value[0], `${path}[0]`, depth + 1)
+        : [`${path}: empty array`];
     }
+
+    if (typeof value !== "object") {
+      return [`${path}: ${typeof value}`];
+    }
+
+    return Object.entries(value).flatMap(([key, child]) =>
+      inspectShape(child, `${path}.${key}`, depth + 1)
+    );
+  }
+
+  console.error("GALLABOX_PAYLOAD_SCHEMA", inspectShape(body));
+
+  return res.status(422).json({
+    error: "missing_phone",
+    message: "Inspect Vercel logs for GALLABOX_PAYLOAD_SCHEMA.",
+  });
+}
+
 
     // Keep digits and an optional leading plus.
     const phone = rawPhone.replace(/[^\d+]/g, "");
