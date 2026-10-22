@@ -9,18 +9,16 @@
  *   ZYRO_API_KEY
  *   GALLABOX_WEBHOOK_SECRET
  *
- * Gallabox webhook URL:
- *   https://YOUR-DOMAIN/api/gallabox-webhook?secret=YOUR_SECRET
+ * Endpoint:
+ *   /api/gallabox-webhook?secret=YOUR_SECRET
  *
- * IMPORTANT:
- * - Confirm Zyro's accepted payload fields and success status.
- * - This labels leads as high priority in campaign/notes.
- * - It does not set a native Zyro priority field unless Zyro supports it.
+ * Important:
+ * - Phone mapping uses the confirmed Gallabox field whatsapp.from.
+ * - Zyro's accepted fields must match its API contract.
+ * - High priority is labelled in campaign/notes, not guaranteed
+ *   to set a native Zyro priority field.
+ * - Persistent duplicate protection is not included.
  */
-
-const processedEvents = new Map();
-const MAX_CACHE_SIZE = 5000;
-const EVENT_TTL_MS = 24 * 60 * 60 * 1000;
 
 function cleanString(value) {
   if (typeof value !== "string" && typeof value !== "number") {
@@ -35,89 +33,92 @@ function getHeader(req, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function isDuplicate(eventId) {
-  if (!eventId) return false;
-
-  const now = Date.now();
-
-  for (const [id, timestamp] of processedEvents) {
-    if (now - timestamp > EVENT_TTL_MS) {
-      processedEvents.delete(id);
-    }
-  }
-
-  if (processedEvents.has(eventId)) {
-    return true;
-  }
-
-  // Prevent unbounded memory growth in the serverless instance.
-  if (processedEvents.size >= MAX_CACHE_SIZE) {
-    const oldestId = processedEvents.keys().next().value;
-    if (oldestId) processedEvents.delete(oldestId);
-  }
-
-  processedEvents.set(eventId, now);
-  return false;
+function redactSensitiveData(value) {
+  return String(value)
+    .replace(
+      /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+      "[REDACTED_EMAIL]"
+    )
+    .replace(
+      /\+?\d[\d\s().-]{7,}\d/g,
+      "[REDACTED_PHONE]"
+    )
+    .slice(0, 3000);
 }
 
-function getSafeEventId(body) {
-  return cleanString(
-    body.id ||
-    body.localMessageId ||
-    ""
-  );
+function getPayloadRoot(body) {
+  // Support both the confirmed direct payload and a data wrapper.
+  if (
+    body.data &&
+    typeof body.data === "object" &&
+    !Array.isArray(body.data)
+  ) {
+    return body.data;
+  }
+
+  return body;
 }
 
 function buildLead(body) {
-  // Field paths confirmed from the actual Gallabox webhook schema.
-  const contact = body.contact || {};
-  const whatsapp = body.whatsapp || {};
+  const root = getPayloadRoot(body);
+
+  const contact = root.contact || body.contact || {};
+  const whatsapp = root.whatsapp || body.whatsapp || {};
   const whatsappText = whatsapp.text || {};
 
-  const name =
-    cleanString(contact.name) ||
-    cleanString(body.name) ||
-    "WhatsApp enquiry";
-
-  const rawPhone =
-    cleanString(whatsapp.from) ||
-    cleanString(contact.phone) ||
-    cleanString(contact.phoneNumber) ||
-    cleanString(body.phone) ||
-    cleanString(body.phoneNumber);
+  // Confirmed Gallabox payload: whatsapp.from
+  const rawPhone = cleanString(whatsapp.from);
 
   if (!rawPhone) {
-    return {
-      error: "missing_phone",
-    };
+    console.error("GALLABOX_PHONE_FIELD_DIAGNOSTIC", {
+      rootKeys: Object.keys(root),
+      bodyKeys: Object.keys(body),
+      whatsappKeys: Object.keys(whatsapp),
+      contactKeys: Object.keys(contact),
+      hasDataWrapper: Boolean(body.data),
+    });
+
+    return { error: "missing_phone" };
   }
 
-  // Preserve digits and a possible international + prefix.
+  // Do not use fromBSUID as a phone number; it may be a different ID.
   const phone = rawPhone.replace(/[^\d+]/g, "");
 
   if (phone.replace(/\D/g, "").length < 8) {
-    return {
-      error: "invalid_phone",
-    };
+    return { error: "invalid_phone" };
   }
+
+  const name =
+    cleanString(contact.name) ||
+    cleanString(root.name) ||
+    "WhatsApp enquiry";
 
   const email =
     cleanString(contact.email) ||
+    cleanString(root.email) ||
     cleanString(body.email);
 
   const message =
     cleanString(whatsappText.body) ||
-    cleanString(body.message) ||
+    cleanString(root.message) ||
     "";
 
-  const conversationId =
-    cleanString(body.conversationId);
+  const conversationId = cleanString(
+    root.conversationId || body.conversationId
+  );
 
-  const contactId =
-    cleanString(body.contactId) ||
-    cleanString(contact.id);
+  const contactId = cleanString(
+    root.contactId ||
+    contact.id ||
+    body.contactId
+  );
 
-  const eventId = getSafeEventId(body);
+  const eventId = cleanString(
+    root.id ||
+    root.localMessageId ||
+    body.id ||
+    body.localMessageId
+  );
 
   const notes = [
     "HIGH PRIORITY LEAD - GALLABOX WHATSAPP",
@@ -128,6 +129,7 @@ function buildLead(body) {
     `Customer message: ${message || "No text message supplied"}`,
   ].join("\n");
 
+  // Preserve the Zyro endpoint and payload structure used previously.
   const payload = {
     name,
     phone,
@@ -146,16 +148,17 @@ function buildLead(body) {
 }
 
 export default async function handler(req, res) {
+  // Only accept POST requests.
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
+
     return res.status(405).json({
       error: "method_not_allowed",
     });
   }
 
-  // Authenticate the incoming webhook.
-  const expectedSecret =
-    process.env.GALLABOX_WEBHOOK_SECRET;
+  // Authenticate Gallabox's webhook request.
+  const expectedSecret = process.env.GALLABOX_WEBHOOK_SECRET;
 
   const suppliedSecret =
     getHeader(req, "x-webhook-secret") ||
@@ -171,23 +174,33 @@ export default async function handler(req, res) {
     });
   }
 
-  const zyroBaseUrl =
-    process.env.ZYRO_BASE_URL;
-
-  const zyroApiKey =
-    process.env.ZYRO_API_KEY;
+  // Validate Zyro configuration.
+  const zyroBaseUrl = process.env.ZYRO_BASE_URL;
+  const zyroApiKey = process.env.ZYRO_API_KEY;
 
   if (!zyroBaseUrl || !zyroApiKey) {
-    console.error(
-      "Gallabox integration: missing Zyro environment variables"
-    );
+    console.error("GALLABOX_CONFIG_ERROR", {
+      hasZyroBaseUrl: Boolean(zyroBaseUrl),
+      hasZyroApiKey: Boolean(zyroApiKey),
+    });
 
     return res.status(500).json({
       error: "server_misconfigured",
     });
   }
 
-  const body = req.body;
+  let body = req.body;
+
+  // Some deployments or clients may send a JSON string.
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {
+      return res.status(400).json({
+        error: "invalid_json",
+      });
+    }
+  }
 
   if (
     !body ||
@@ -199,54 +212,19 @@ export default async function handler(req, res) {
     });
   }
 
-  // Ignore non-inbound message events if the webhook is configured
-  // to send more than Message.Received.
-  const senderType = cleanString(body.senderType);
-
-  if (
-    senderType &&
-    !["contact", "customer", "user"].includes(
-      senderType.toLowerCase()
-    )
-  ) {
-    return res.status(200).json({
-      ok: true,
-      skipped: true,
-      reason: "not_an_inbound_customer_message",
-    });
-  }
-
   const lead = buildLead(body);
 
   if (lead.error) {
-    // Never log customer message content or personal information.
-    console.error(
-      "Gallabox webhook payload validation failed:",
-      lead.error
-    );
+    console.error("GALLABOX_PAYLOAD_VALIDATION_FAILED", {
+      error: lead.error,
+    });
 
     return res.status(422).json({
       error: lead.error,
       message:
         lead.error === "missing_phone"
-          ? "No supported phone field was found."
-          : "The supplied phone number is invalid.",
-    });
-  }
-
-  /*
-   * NOTE ON DUPLICATES:
-   * This in-memory check only works within the same warm serverless
-   * instance. It is NOT reliable across Vercel instances or cold starts.
-   * Use a shared database with a unique event-ID constraint for
-   * production-grade idempotency.
-   */
-
-  if (lead.eventId && isDuplicate(lead.eventId)) {
-    return res.status(200).json({
-      ok: true,
-      duplicate: true,
-      message: "Event already processed in this instance.",
+          ? "Expected phone at whatsapp.from."
+          : "The phone number is invalid.",
     });
   }
 
@@ -274,13 +252,12 @@ export default async function handler(req, res) {
         ? JSON.parse(responseText)
         : {};
     } catch {
-      // Zyro may return a non-JSON response.
+      // A non-JSON response is allowed; retain it for diagnostics.
       zyroResult = {};
     }
 
-    // Treat all 2xx responses as HTTP success.
     if (zyroResponse.ok) {
-      console.log("Gallabox lead accepted by Zyro", {
+      console.log("GALLABOX_ZYRO_LEAD_CREATED", {
         status: zyroResponse.status,
         eventIdPresent: Boolean(lead.eventId),
       });
@@ -297,9 +274,11 @@ export default async function handler(req, res) {
       });
     }
 
-    // Don't expose Zyro's response body or credentials to Gallabox.
-    console.error("Zyro lead creation failed", {
+    // Log Zyro's validation response to diagnose HTTP 422.
+    // Never log the API key or the submitted lead payload.
+    console.error("ZYRO_LEAD_REJECTION", {
       status: zyroResponse.status,
+      response: redactSensitiveData(responseText),
       eventIdPresent: Boolean(lead.eventId),
     });
 
@@ -308,7 +287,7 @@ export default async function handler(req, res) {
       zyro_status: zyroResponse.status,
     });
   } catch (error) {
-    console.error("Gallabox -> Zyro request failed", {
+    console.error("GALLABOX_ZYRO_REQUEST_FAILED", {
       message: error?.message || "unknown_error",
     });
 
