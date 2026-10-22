@@ -123,9 +123,6 @@ function buildLead(body) {
   const notes = [
     "HIGH PRIORITY LEAD - GALLABOX WHATSAPP",
     "Source: Gallabox WhatsApp",
-    `Conversation ID: ${conversationId || "Not supplied"}`,
-    `Contact ID: ${contactId || "Not supplied"}`,
-    `Message ID: ${eventId || "Not supplied"}`,
     `Customer message: ${message || "No text message supplied"}`,
   ].join("\n");
 
