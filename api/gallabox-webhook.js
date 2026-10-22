@@ -2,191 +2,318 @@
 /**
  * api/gallabox-webhook.js
  *
- * Gallabox WhatsApp -> Vercel -> Zyro lead API
+ * Gallabox WhatsApp -> Vercel -> Zyro Leads API
  *
- * Environment variables:
+ * Required Vercel environment variables:
  *   ZYRO_BASE_URL
  *   ZYRO_API_KEY
  *   GALLABOX_WEBHOOK_SECRET
+ *
+ * Gallabox webhook URL:
+ *   https://YOUR-DOMAIN/api/gallabox-webhook?secret=YOUR_SECRET
+ *
+ * IMPORTANT:
+ * - Confirm Zyro's accepted payload fields and success status.
+ * - This labels leads as high priority in campaign/notes.
+ * - It does not set a native Zyro priority field unless Zyro supports it.
  */
+
+const processedEvents = new Map();
+const MAX_CACHE_SIZE = 5000;
+const EVENT_TTL_MS = 24 * 60 * 60 * 1000;
+
+function cleanString(value) {
+  if (typeof value !== "string" && typeof value !== "number") {
+    return "";
+  }
+
+  return String(value).trim();
+}
+
+function getHeader(req, name) {
+  const value = req.headers?.[name.toLowerCase()];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function isDuplicate(eventId) {
+  if (!eventId) return false;
+
+  const now = Date.now();
+
+  for (const [id, timestamp] of processedEvents) {
+    if (now - timestamp > EVENT_TTL_MS) {
+      processedEvents.delete(id);
+    }
+  }
+
+  if (processedEvents.has(eventId)) {
+    return true;
+  }
+
+  // Prevent unbounded memory growth in the serverless instance.
+  if (processedEvents.size >= MAX_CACHE_SIZE) {
+    const oldestId = processedEvents.keys().next().value;
+    if (oldestId) processedEvents.delete(oldestId);
+  }
+
+  processedEvents.set(eventId, now);
+  return false;
+}
+
+function getSafeEventId(body) {
+  return cleanString(
+    body.id ||
+    body.localMessageId ||
+    ""
+  );
+}
+
+function buildLead(body) {
+  // Field paths confirmed from the actual Gallabox webhook schema.
+  const contact = body.contact || {};
+  const whatsapp = body.whatsapp || {};
+  const whatsappText = whatsapp.text || {};
+
+  const name =
+    cleanString(contact.name) ||
+    cleanString(body.name) ||
+    "WhatsApp enquiry";
+
+  const rawPhone =
+    cleanString(whatsapp.from) ||
+    cleanString(contact.phone) ||
+    cleanString(contact.phoneNumber) ||
+    cleanString(body.phone) ||
+    cleanString(body.phoneNumber);
+
+  if (!rawPhone) {
+    return {
+      error: "missing_phone",
+    };
+  }
+
+  // Preserve digits and a possible international + prefix.
+  const phone = rawPhone.replace(/[^\d+]/g, "");
+
+  if (phone.replace(/\D/g, "").length < 8) {
+    return {
+      error: "invalid_phone",
+    };
+  }
+
+  const email =
+    cleanString(contact.email) ||
+    cleanString(body.email);
+
+  const message =
+    cleanString(whatsappText.body) ||
+    cleanString(body.message) ||
+    "";
+
+  const conversationId =
+    cleanString(body.conversationId);
+
+  const contactId =
+    cleanString(body.contactId) ||
+    cleanString(contact.id);
+
+  const eventId = getSafeEventId(body);
+
+  const notes = [
+    "HIGH PRIORITY LEAD - GALLABOX WHATSAPP",
+    "Source: Gallabox WhatsApp",
+    `Conversation ID: ${conversationId || "Not supplied"}`,
+    `Contact ID: ${contactId || "Not supplied"}`,
+    `Message ID: ${eventId || "Not supplied"}`,
+    `Customer message: ${message || "No text message supplied"}`,
+  ].join("\n");
+
+  const payload = {
+    name,
+    phone,
+    ...(email ? { email } : {}),
+    source: "whatsapp",
+    campaign: "gallabox_whatsapp_high_priority",
+    notes,
+  };
+
+  return {
+    payload,
+    eventId,
+    conversationId,
+    contactId,
+  };
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
-    return res.status(405).json({ error: "method_not_allowed" });
+    return res.status(405).json({
+      error: "method_not_allowed",
+    });
   }
 
-  // Protect the endpoint. Configure Gallabox with this secret in its
-  // webhook URL if supported, or use the x-webhook-secret header.
-  const expectedSecret = process.env.GALLABOX_WEBHOOK_SECRET;
+  // Authenticate the incoming webhook.
+  const expectedSecret =
+    process.env.GALLABOX_WEBHOOK_SECRET;
+
   const suppliedSecret =
-    req.headers["x-webhook-secret"] ||
-    req.query?.secret;
+    getHeader(req, "x-webhook-secret") ||
+    cleanString(req.query?.secret);
 
-  if (!expectedSecret || suppliedSecret !== expectedSecret) {
-    return res.status(401).json({ error: "unauthorized" });
+  if (
+    !expectedSecret ||
+    !suppliedSecret ||
+    suppliedSecret !== expectedSecret
+  ) {
+    return res.status(401).json({
+      error: "unauthorized",
+    });
   }
 
-  const ZYRO_BASE = process.env.ZYRO_BASE_URL;
-  const ZYRO_KEY = process.env.ZYRO_API_KEY;
+  const zyroBaseUrl =
+    process.env.ZYRO_BASE_URL;
 
-  if (!ZYRO_BASE || !ZYRO_KEY) {
-    console.error("Gallabox integration: Zyro environment is missing");
-    return res.status(500).json({ error: "server_misconfigured" });
+  const zyroApiKey =
+    process.env.ZYRO_API_KEY;
+
+  if (!zyroBaseUrl || !zyroApiKey) {
+    console.error(
+      "Gallabox integration: missing Zyro environment variables"
+    );
+
+    return res.status(500).json({
+      error: "server_misconfigured",
+    });
+  }
+
+  const body = req.body;
+
+  if (
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body)
+  ) {
+    return res.status(400).json({
+      error: "invalid_payload",
+    });
+  }
+
+  // Ignore non-inbound message events if the webhook is configured
+  // to send more than Message.Received.
+  const senderType = cleanString(body.senderType);
+
+  if (
+    senderType &&
+    !["contact", "customer", "user"].includes(
+      senderType.toLowerCase()
+    )
+  ) {
+    return res.status(200).json({
+      ok: true,
+      skipped: true,
+      reason: "not_an_inbound_customer_message",
+    });
+  }
+
+  const lead = buildLead(body);
+
+  if (lead.error) {
+    // Never log customer message content or personal information.
+    console.error(
+      "Gallabox webhook payload validation failed:",
+      lead.error
+    );
+
+    return res.status(422).json({
+      error: lead.error,
+      message:
+        lead.error === "missing_phone"
+          ? "No supported phone field was found."
+          : "The supplied phone number is invalid.",
+    });
+  }
+
+  /*
+   * NOTE ON DUPLICATES:
+   * This in-memory check only works within the same warm serverless
+   * instance. It is NOT reliable across Vercel instances or cold starts.
+   * Use a shared database with a unique event-ID constraint for
+   * production-grade idempotency.
+   */
+
+  if (lead.eventId && isDuplicate(lead.eventId)) {
+    return res.status(200).json({
+      ok: true,
+      duplicate: true,
+      message: "Event already processed in this instance.",
+    });
   }
 
   try {
-    const body = req.body;
+    const endpoint =
+      `${zyroBaseUrl.replace(/\/+$/, "")}` +
+      "/api/v2/webhooks/leads";
 
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-      return res.status(400).json({ error: "invalid_payload" });
+    const zyroResponse = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${zyroApiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(lead.payload),
+    });
+
+    const responseText = await zyroResponse.text();
+
+    let zyroResult = {};
+
+    try {
+      zyroResult = responseText
+        ? JSON.parse(responseText)
+        : {};
+    } catch {
+      // Zyro may return a non-JSON response.
+      zyroResult = {};
     }
 
-    // Search common names in the root and typical nested objects.
-    // Verify these against Gallabox's actual webhook response.
-    const objects = [
-      body,
-      body.data,
-      body.contact,
-      body.customer,
-      body.message,
-      body.conversation,
-      body.data?.contact,
-      body.data?.customer,
-      body.data?.message,
-      body.data?.conversation,
-    ].filter((item) => item && typeof item === "object");
-
-    function pick(...keys) {
-      for (const obj of objects) {
-        for (const key of keys) {
-          const value = obj[key];
-          if (
-            value !== undefined &&
-            value !== null &&
-            typeof value !== "object" &&
-            String(value).trim() !== ""
-          ) {
-            return String(value).trim();
-          }
-        }
-      }
-      return undefined;
-    }
-
-    const name = pick(
-      "name", "contactName", "contact_name",
-      "customerName", "customer_name", "fullName"
-    );
-
-    const rawPhone = pick(
-      "phone", "phoneNumber", "phone_number",
-      "mobile", "mobileNumber", "waId", "wa_id"
-    );
-
-    const email = pick("email", "emailAddress", "email_address");
-    const message = pick("text", "body", "messageText", "message_text");
-    const conversationId = pick(
-      "conversationId", "conversation_id", "id"
-    );
-    const event = pick("event", "eventType", "event_type", "type");
-
-
-if (!rawPhone) {
-  // Log field names and data types, NOT customer data.
-  function inspectShape(value, path = "body", depth = 0) {
-    if (depth > 5 || value == null) return [];
-
-    if (Array.isArray(value)) {
-      return value.length
-        ? inspectShape(value[0], `${path}[0]`, depth + 1)
-        : [`${path}: empty array`];
-    }
-
-    if (typeof value !== "object") {
-      return [`${path}: ${typeof value}`];
-    }
-
-    return Object.entries(value).flatMap(([key, child]) =>
-      inspectShape(child, `${path}.${key}`, depth + 1)
-    );
-  }
-
-  console.error("GALLABOX_PAYLOAD_SCHEMA", inspectShape(body));
-
-  return res.status(422).json({
-    error: "missing_phone",
-    message: "Inspect Vercel logs for GALLABOX_PAYLOAD_SCHEMA.",
-  });
-}
-
-
-    // Keep digits and an optional leading plus.
-    const phone = rawPhone.replace(/[^\d+]/g, "");
-
-    if (phone.replace(/\D/g, "").length < 8) {
-      return res.status(422).json({ error: "invalid_phone" });
-    }
-
-    const notes = [
-      "HIGH PRIORITY LEAD — GALLABOX WHATSAPP",
-      `Event: ${event || "not supplied"}`,
-      `Conversation ID: ${conversationId || "not supplied"}`,
-      `Customer message: ${message || "not supplied in webhook"}`,
-      "Source: Gallabox WhatsApp",
-    ].join("\n");
-
-    const payload = {
-      name: name || "WhatsApp enquiry",
-      phone,
-      ...(email ? { email } : {}),
-      source: "whatsapp",
-      campaign: "gallabox_whatsapp_high_priority",
-      notes,
-    };
-
-    const response = await fetch(
-      `${ZYRO_BASE.replace(/\/+$/, "")}/api/v2/webhooks/leads`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${ZYRO_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      }
-    );
-
-    const result = await response.json().catch(() => ({}));
-
-    if (response.status === 201) {
-      console.log("Gallabox lead created", {
-        status: response.status,
-        leadId: result.id || null,
+    // Treat all 2xx responses as HTTP success.
+    if (zyroResponse.ok) {
+      console.log("Gallabox lead accepted by Zyro", {
+        status: zyroResponse.status,
+        eventIdPresent: Boolean(lead.eventId),
       });
 
       return res.status(200).json({
         ok: true,
-        lead_id: result.id || null,
         source: "gallabox_whatsapp",
         priority_label: "high",
+        zyro_status: zyroResponse.status,
+        lead_id:
+          zyroResult.id ||
+          zyroResult.leadId ||
+          null,
       });
     }
 
-    // Don't acknowledge a failed Zyro write as successful.
-    console.error("Zyro rejected Gallabox lead", {
-      status: response.status,
+    // Don't expose Zyro's response body or credentials to Gallabox.
+    console.error("Zyro lead creation failed", {
+      status: zyroResponse.status,
+      eventIdPresent: Boolean(lead.eventId),
     });
 
     return res.status(502).json({
       error: "zyro_lead_creation_failed",
-      zyro_status: response.status,
+      zyro_status: zyroResponse.status,
     });
   } catch (error) {
-    console.error("Gallabox webhook processing failed", {
+    console.error("Gallabox -> Zyro request failed", {
       message: error?.message || "unknown_error",
     });
 
-    return res.status(500).json({ error: "internal_error" });
+    return res.status(502).json({
+      error: "zyro_request_failed",
+    });
   }
 }
