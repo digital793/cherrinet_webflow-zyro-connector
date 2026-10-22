@@ -4,28 +4,20 @@
  *
  * Gallabox WhatsApp -> Vercel -> Zyro Leads API
  *
- * Required Vercel environment variables:
- *   ZYRO_BASE_URL
- *   ZYRO_API_KEY
- *   GALLABOX_WEBHOOK_SECRET
+ * Vercel environment variables:
+ *   ZYRO_BASE_URL=https://tickets.knet.co.in
+ *   ZYRO_API_KEY=your_existing_zyro_api_key
+ *   GALLABOX_WEBHOOK_SECRET=your_existing_webhook_secret
  *
- * Endpoint:
- *   /api/gallabox-webhook?secret=YOUR_SECRET
- *
- * Important:
- * - Phone mapping uses the confirmed Gallabox field whatsapp.from.
- * - Zyro's accepted fields must match its API contract.
- * - High priority is labelled in campaign/notes, not guaranteed
- *   to set a native Zyro priority field.
- * - Persistent duplicate protection is not included.
+ * Gallabox webhook:
+ *   POST /api/gallabox-webhook?secret=YOUR_SECRET
  */
 
 function cleanString(value) {
-  if (typeof value !== "string" && typeof value !== "number") {
-    return "";
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value).trim();
   }
-
-  return String(value).trim();
+  return "";
 }
 
 function getHeader(req, name) {
@@ -33,30 +25,50 @@ function getHeader(req, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function redactSensitiveData(value) {
-  return String(value)
-    .replace(
-      /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
-      "[REDACTED_EMAIL]"
-    )
-    .replace(
-      /\+?\d[\d\s().-]{7,}\d/g,
-      "[REDACTED_PHONE]"
-    )
-    .slice(0, 3000);
-}
-
 function getPayloadRoot(body) {
-  // Support both the confirmed direct payload and a data wrapper.
   if (
-    body.data &&
+    body?.data &&
     typeof body.data === "object" &&
     !Array.isArray(body.data)
   ) {
     return body.data;
   }
-
   return body;
+}
+
+function firstText(...values) {
+  for (const value of values) {
+    const text = cleanString(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+function extractWhatsAppMessage(body) {
+  const root = getPayloadRoot(body);
+
+  const candidates = [
+    root.whatsapp?.text?.body,
+    body.whatsapp?.text?.body,
+    root.message?.text?.body,
+    root.message?.text,
+    root.message?.body,
+    root.text?.body,
+    root.text,
+    root.whatsapp?.body,
+    root.messageText,
+    root.content,
+    body.messageText,
+    body.content,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return "";
 }
 
 function buildLead(body) {
@@ -64,99 +76,111 @@ function buildLead(body) {
 
   const contact = root.contact || body.contact || {};
   const whatsapp = root.whatsapp || body.whatsapp || {};
-  const whatsappText = whatsapp.text || {};
 
-  // Confirmed Gallabox payload: whatsapp.from
-  const rawPhone = cleanString(whatsapp.from);
+  const rawPhone = firstText(
+    whatsapp.from,
+    root.from,
+    contact.phone,
+    contact.phoneNumber
+  );
 
   if (!rawPhone) {
-    console.error("GALLABOX_PHONE_FIELD_DIAGNOSTIC", {
+    console.error("GALLABOX_MISSING_PHONE", {
       rootKeys: Object.keys(root),
       bodyKeys: Object.keys(body),
       whatsappKeys: Object.keys(whatsapp),
       contactKeys: Object.keys(contact),
-      hasDataWrapper: Boolean(body.data),
     });
 
     return { error: "missing_phone" };
   }
 
-  // Do not use fromBSUID as a phone number; it may be a different ID.
+  // Preserve the international prefix and remove formatting characters.
   const phone = rawPhone.replace(/[^\d+]/g, "");
 
   if (phone.replace(/\D/g, "").length < 8) {
     return { error: "invalid_phone" };
   }
 
-  const name =
-    cleanString(contact.name) ||
-    cleanString(root.name) ||
-    "WhatsApp enquiry";
+  const name = firstText(
+    contact.name,
+    root.name,
+    body.name
+  ) || "WhatsApp enquiry";
 
-  const email =
-    cleanString(contact.email) ||
-    cleanString(root.email) ||
-    cleanString(body.email);
-
-  const message =
-    cleanString(whatsappText.body) ||
-    cleanString(root.message) ||
-    "";
-
-  const conversationId = cleanString(
-    root.conversationId || body.conversationId
+  const email = firstText(
+    contact.email,
+    root.email,
+    body.email
   );
 
-  const contactId = cleanString(
-    root.contactId ||
-    contact.id ||
+  const message = extractWhatsAppMessage(body);
+
+  const conversationId = firstText(
+    root.conversationId,
+    body.conversationId
+  );
+
+  const contactId = firstText(
+    root.contactId,
+    contact.id,
     body.contactId
   );
 
-  const eventId = cleanString(
-    root.id ||
-    root.localMessageId ||
-    body.id ||
+  const eventId = firstText(
+    root.id,
+    root.localMessageId,
+    body.id,
     body.localMessageId
   );
 
+  const messageType = firstText(
+    whatsapp.type,
+    root.type,
+    body.type
+  );
+
   const notes = [
-    "HIGH PRIORITY LEAD - GALLABOX WHATSAPP",
-    "Source: Gallabox WhatsApp",
+    "GALLABOX WHATSAPP ENQUIRY",
+    `Customer message: ${
+      message || (
+        messageType && messageType.toLowerCase() !== "text"
+          ? `[${messageType} message; no text body supplied]`
+          : "Message text unavailable in webhook payload"
+      )
+    }`,
     `Conversation ID: ${conversationId || "Not supplied"}`,
     `Contact ID: ${contactId || "Not supplied"}`,
     `Message ID: ${eventId || "Not supplied"}`,
-    `Customer message: ${message || "No text message supplied"}`,
   ].join("\n");
 
-  // Preserve the Zyro endpoint and payload structure used previously.
-const payload = {
-  name,
-  phone,
-  ...(email ? { email } : {}),
-  campaign: "gallabox_whatsapp_high_priority",
-  notes,
-};
+  // "whatsapp" was rejected by Zyro's source validation.
+  // "website" is used by the existing working lead integrations.
+  // This is a workaround, not a true WhatsApp source classification.
+  const payload = {
+    name,
+    phone,
+    ...(email ? { email } : {}),
+    source: "website",
+    campaign: "gallabox_whatsapp_high_priority",
+    notes,
+  };
 
   return {
     payload,
     eventId,
     conversationId,
     contactId,
+    hasMessage: Boolean(message),
   };
 }
 
 export default async function handler(req, res) {
-  // Only accept POST requests.
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
-
-    return res.status(405).json({
-      error: "method_not_allowed",
-    });
+    return res.status(405).json({ error: "method_not_allowed" });
   }
 
-  // Authenticate Gallabox's webhook request.
   const expectedSecret = process.env.GALLABOX_WEBHOOK_SECRET;
 
   const suppliedSecret =
@@ -168,12 +192,9 @@ export default async function handler(req, res) {
     !suppliedSecret ||
     suppliedSecret !== expectedSecret
   ) {
-    return res.status(401).json({
-      error: "unauthorized",
-    });
+    return res.status(401).json({ error: "unauthorized" });
   }
 
-  // Validate Zyro configuration.
   const zyroBaseUrl = process.env.ZYRO_BASE_URL;
   const zyroApiKey = process.env.ZYRO_API_KEY;
 
@@ -183,47 +204,29 @@ export default async function handler(req, res) {
       hasZyroApiKey: Boolean(zyroApiKey),
     });
 
-    return res.status(500).json({
-      error: "server_misconfigured",
-    });
+    return res.status(500).json({ error: "server_misconfigured" });
   }
 
   let body = req.body;
 
-  // Some deployments or clients may send a JSON string.
   if (typeof body === "string") {
     try {
       body = JSON.parse(body);
     } catch {
-      return res.status(400).json({
-        error: "invalid_json",
-      });
+      return res.status(400).json({ error: "invalid_json" });
     }
   }
 
-  if (
-    !body ||
-    typeof body !== "object" ||
-    Array.isArray(body)
-  ) {
-    return res.status(400).json({
-      error: "invalid_payload",
-    });
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return res.status(400).json({ error: "invalid_payload" });
   }
 
   const lead = buildLead(body);
 
   if (lead.error) {
-    console.error("GALLABOX_PAYLOAD_VALIDATION_FAILED", {
-      error: lead.error,
-    });
-
     return res.status(422).json({
       error: lead.error,
-      message:
-        lead.error === "missing_phone"
-          ? "Expected phone at whatsapp.from."
-          : "The phone number is invalid.",
+      message: "Check the Gallabox contact phone number.",
     });
   }
 
@@ -244,41 +247,34 @@ export default async function handler(req, res) {
 
     const responseText = await zyroResponse.text();
 
-    let zyroResult = {};
-
+    let result = {};
     try {
-      zyroResult = responseText
-        ? JSON.parse(responseText)
-        : {};
+      result = responseText ? JSON.parse(responseText) : {};
     } catch {
-      // A non-JSON response is allowed; retain it for diagnostics.
-      zyroResult = {};
+      result = {};
     }
 
     if (zyroResponse.ok) {
       console.log("GALLABOX_ZYRO_LEAD_CREATED", {
         status: zyroResponse.status,
         eventIdPresent: Boolean(lead.eventId),
+        messageFound: lead.hasMessage,
       });
 
       return res.status(200).json({
         ok: true,
-        source: "gallabox_whatsapp",
+        source: "website",
         priority_label: "high",
+        message_found: lead.hasMessage,
         zyro_status: zyroResponse.status,
-        lead_id:
-          zyroResult.id ||
-          zyroResult.leadId ||
-          null,
+        lead_id: result.id || result.leadId || null,
       });
     }
 
-    // Log Zyro's validation response to diagnose HTTP 422.
-    // Never log the API key or the submitted lead payload.
+    // Do not log credentials, cookies, or the submitted contact details.
     console.error("ZYRO_LEAD_REJECTION", {
       status: zyroResponse.status,
-      response: redactSensitiveData(responseText),
-      eventIdPresent: Boolean(lead.eventId),
+      response: responseText.slice(0, 1500),
     });
 
     return res.status(502).json({
@@ -290,8 +286,6 @@ export default async function handler(req, res) {
       message: error?.message || "unknown_error",
     });
 
-    return res.status(502).json({
-      error: "zyro_request_failed",
-    });
+    return res.status(502).json({ error: "zyro_request_failed" });
   }
 }
